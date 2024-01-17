@@ -322,6 +322,42 @@ draw_unfocused_block(const struct terminal *term, pixman_image_t *pix,
 }
 
 static void
+draw_unfocused_beam(const struct terminal *term, pixman_image_t *pix,
+                     const pixman_color_t *color, int x, int y, int cell_cols)
+{
+    const int scale = (int)roundf(term->scale);
+    const int width = min(min(scale, term->cell_width), term->cell_height);
+    const int center = term->cell_height / 2;
+
+    pixman_image_fill_rectangles(
+        PIXMAN_OP_SRC, pix, color, 4,
+        (pixman_rectangle16_t []){
+         {x, y, cell_cols * term->cell_width, width},                              /* top */
+         {x, y, width, center},                                                    /* left */
+         {x + cell_cols * term->cell_width - width, y, width, center},             /* right */
+         {x, y + (center) - width, cell_cols * term->cell_width, width},           /* bottom */
+        });
+}
+
+static void
+draw_unfocused_underline(const struct terminal *term, pixman_image_t *pix,
+                     const pixman_color_t *color, int x, int y, int cell_cols)
+{
+    const int scale = (int)roundf(term->scale);
+    const int width = min(min(scale, term->cell_width), term->cell_height);
+    const int center = term->cell_height - (term->cell_height / 2);
+
+    pixman_image_fill_rectangles(
+        PIXMAN_OP_SRC, pix, color, 4,
+        (pixman_rectangle16_t []){
+         {x, y + center, cell_cols * term->cell_width, width},                     /* top */
+         {x, y + center, width, center},                                           /* left */
+         {x + cell_cols * term->cell_width - width, y + center, width, center},    /* right */
+         {x, y + term->cell_height - width, cell_cols * term->cell_width, width},  /* bottom */
+        });
+}
+
+static void
 draw_beam_cursor(const struct terminal *term, pixman_image_t *pix,
                  const struct fcft_font *font,
                  const pixman_color_t *color, int x, int y)
@@ -342,26 +378,6 @@ underline_offset(const struct terminal *term, const struct fcft_font *font)
         (term->conf->use_custom_underline_offset
          ? -term_pt_or_px_as_pixels(term, &term->conf->underline_offset)
          : font->underline.position);
-}
-
-static void
-draw_underline_cursor(const struct terminal *term, pixman_image_t *pix,
-               const struct fcft_font *font,
-                      const pixman_color_t *color, int x, int y, int cols)
-{
-    int thickness = term->conf->cursor.underline_thickness.px >= 0
-        ? term_pt_or_px_as_pixels(
-            term, &term->conf->cursor.underline_thickness)
-        : font->underline.thickness;
-
-    /* Make sure the line isn't positioned below the cell */
-    const int y_ofs = min(underline_offset(term, font) + thickness,
-                          term->cell_height - thickness);
-
-    pixman_image_fill_rectangles(
-        PIXMAN_OP_SRC, pix, color,
-        1, &(pixman_rectangle16_t){
-            x, y + y_ofs, cols * term->cell_width, thickness});
 }
 
 static void
@@ -441,18 +457,26 @@ draw_cursor(const struct terminal *term, const struct cell *cell,
         break;
 
     case CURSOR_BEAM:
-        if (likely(term->cursor_blink.state == CURSOR_BLINK_ON ||
-                   !term->kbd_focus))
+        if (unlikely(!term->kbd_focus))
+            draw_unfocused_beam(term, pix, &cursor_color, x, y, cols);
+
+        else if (likely(term->cursor_blink.state == CURSOR_BLINK_ON))
         {
-            draw_beam_cursor(term, pix, font, &cursor_color, x, y);
+            pixman_image_fill_rectangles(
+                PIXMAN_OP_SRC, pix, &cursor_color, 1,
+                &(pixman_rectangle16_t){x, y, cols * term->cell_width, term->cell_height / 2});
         }
         break;
 
     case CURSOR_UNDERLINE:
-        if (likely(term->cursor_blink.state == CURSOR_BLINK_ON ||
-                   !term->kbd_focus))
+        if (unlikely(!term->kbd_focus))
+            draw_unfocused_underline(term, pix, &cursor_color, x, y, cols);
+
+        else if (likely(term->cursor_blink.state == CURSOR_BLINK_ON))
         {
-            draw_underline_cursor(term, pix, font, &cursor_color, x, y, cols);
+            pixman_image_fill_rectangles(
+                PIXMAN_OP_SRC, pix, &cursor_color, 1,
+                &(pixman_rectangle16_t){x, y + term->cell_height - (term->cell_height / 2), cols * term->cell_width, term->cell_height - (term->cell_height / 2)});
         }
         break;
     }
@@ -746,16 +770,17 @@ render_cell(struct terminal *term, pixman_image_t *pix, pixman_region32_t *damag
         mtx_unlock(&term->render.workers.lock);
     }
 
-    if (unlikely(has_cursor && term->cursor_style == CURSOR_BLOCK && term->kbd_focus))
+    if (unlikely(has_cursor))
         draw_cursor(term, cell, font, pix, &fg, &bg, x, y, cell_cols);
 
     if (cell->wc == 0 || cell->wc >= CELL_SPACER || cell->wc == U'\t' ||
         (unlikely(cell->attrs.conceal) && !is_selected))
     {
-        goto draw_cursor;
+        goto early_return;
     }
 
     pixman_image_t *clr_pix = pixman_image_create_solid_fill(&fg);
+    pixman_image_t *clr_pix_cursor = pixman_image_create_solid_fill(&bg);
 
     int pen_x = x;
     for (unsigned i = 0; i < glyph_count; i++) {
@@ -784,6 +809,35 @@ render_cell(struct terminal *term, pixman_image_t *pix, pixman_region32_t *damag
                 PIXMAN_OP_OVER, clr_pix, glyph->pix, pix, 0, 0, 0, 0,
                 pen_x + letter_x_ofs + g_x, y + term->font_baseline - g_y,
                 glyph->width, glyph->height);
+
+            if (unlikely(has_cursor && term->kbd_focus)) {
+                if (term->cursor_style == CURSOR_UNDERLINE) {
+                    int center_line = term->cell_height - (term->cell_height / 2);
+                    int mask_x = center_line - term->font_baseline + g_y;
+
+                    if (mask_x >= 0) {
+                        pixman_image_composite32(
+                            PIXMAN_OP_OVER, clr_pix_cursor, glyph->pix, pix, 0, 0, 0, mask_x,
+                            pen_x + letter_x_ofs + g_x, y + center_line,
+                            glyph->width, glyph->height);
+                    } else {
+                        pixman_image_composite32(
+                            PIXMAN_OP_OVER, clr_pix_cursor, glyph->pix, pix, 0, 0, 0, 0,
+                            pen_x + letter_x_ofs + g_x, y + center_line - mask_x,
+                            glyph->width, glyph->height);
+                    }
+                } else if (term->cursor_style == CURSOR_BEAM) {
+                    int center_line = (term->cell_height / 2);
+                    int mask_x = center_line - term->font_baseline + g_y;
+
+                    if (likely(mask_x >= 0)) {
+                        pixman_image_composite32(
+                            PIXMAN_OP_OVER, clr_pix_cursor, glyph->pix, pix, 0, 0, 0, 0,
+                            pen_x + letter_x_ofs + g_x, y + term->font_baseline - g_y,
+                            glyph->width, mask_x);
+                    }
+                }
+            }
 
             /* Combining characters */
             if (composed != NULL) {
@@ -832,6 +886,7 @@ render_cell(struct terminal *term, pixman_image_t *pix, pixman_region32_t *damag
     }
 
     pixman_image_unref(clr_pix);
+    pixman_image_unref(clr_pix_cursor);
 
     /* Underline */
     if (cell->attrs.underline)
@@ -849,9 +904,7 @@ render_cell(struct terminal *term, pixman_image_t *pix, pixman_region32_t *damag
         draw_underline(term, pix, font, &url_color, x, y, cell_cols);
     }
 
-draw_cursor:
-    if (has_cursor && (term->cursor_style != CURSOR_BLOCK || !term->kbd_focus))
-        draw_cursor(term, cell, font, pix, &fg, &bg, x, y, cell_cols);
+early_return:
 
     pixman_image_set_clip_region32(pix, NULL);
     return cell_cols;
